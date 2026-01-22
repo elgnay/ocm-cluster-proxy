@@ -2,9 +2,11 @@ package registration
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
-	"k8s.io/apimachinery/pkg/api/errors"
+	certificatesv1 "k8s.io/api/certificates/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -66,6 +68,61 @@ func NewAddonRegistrationController(
 		WithSync(c.sync).ToController("addon-registration-controller")
 }
 
+// buildRegistrationConfigs builds registration configs from new configs and existing registrations.
+// For KubeAPIServerClientSignerName, handling depends on kubeClientDriver:
+//   - "": excludes the config from result, returns registrationConfigReady=false
+//   - "token": preserves subject from existing registrations
+//   - others (e.g., "csr"): uses subject from newConfigs
+//
+// For other signer names, always uses subject from newConfigs.
+func buildRegistrationConfigs(newConfigs, existingRegistrations []addonapiv1alpha1.RegistrationConfig,
+	kubeClientDriver string) ([]addonapiv1alpha1.RegistrationConfig, bool) {
+	result := []addonapiv1alpha1.RegistrationConfig{}
+	registrationConfigReady := true
+
+	for i := range newConfigs {
+		config := addonapiv1alpha1.RegistrationConfig{
+			SignerName: newConfigs[i].SignerName,
+			Subject:    newConfigs[i].Subject,
+		}
+
+		// Only apply special handling for KubeAPIServerClientSignerName
+		if config.SignerName != certificatesv1.KubeAPIServerClientSignerName {
+			result = append(result, config)
+			continue
+		}
+
+		// If kubeClientDriver is not set, skip kubeclient registration config
+		if kubeClientDriver == "" {
+			registrationConfigReady = false
+			continue
+		}
+
+		if kubeClientDriver == "token" {
+			// Token driver - preserve existing subject set by agent
+			found := false
+			for j := range existingRegistrations {
+				if existingRegistrations[j].SignerName == config.SignerName {
+					config.Subject = existingRegistrations[j].Subject
+					found = true
+					break
+				}
+			}
+			// If no matching existing registration found, clear subject (agent will set it).
+			// registrationConfigReady remains true because the hub controller has done what it can - the agent
+			// is responsible for setting the subject, and the hub will pick it up on next reconciliation.
+			if !found {
+				config.Subject = addonapiv1alpha1.Subject{}
+			}
+		}
+		// For other drivers (e.g., "csr"), use subject from newConfigs
+
+		result = append(result, config)
+	}
+
+	return result, registrationConfigReady
+}
+
 func (c *addonRegistrationController) sync(ctx context.Context, syncCtx factory.SyncContext, key string) error {
 	klog.V(4).Infof("Reconciling addon registration %q", key)
 
@@ -82,7 +139,7 @@ func (c *addonRegistrationController) sync(ctx context.Context, syncCtx factory.
 
 	// Get ManagedCluster
 	managedCluster, err := c.managedClusterLister.Get(clusterName)
-	if errors.IsNotFound(err) {
+	if apierrors.IsNotFound(err) {
 		return nil
 	}
 	if err != nil {
@@ -90,7 +147,7 @@ func (c *addonRegistrationController) sync(ctx context.Context, syncCtx factory.
 	}
 
 	managedClusterAddon, err := c.managedClusterAddonLister.ManagedClusterAddOns(clusterName).Get(addonName)
-	if errors.IsNotFound(err) {
+	if apierrors.IsNotFound(err) {
 		return nil
 	}
 	if err != nil {
@@ -148,20 +205,31 @@ func (c *addonRegistrationController) sync(ctx context.Context, syncCtx factory.
 		return nil
 	}
 
+	// Track whether permission is ready
+	permissionReady := true
+
 	if registrationOption.PermissionConfig != nil {
 		err = registrationOption.PermissionConfig(managedCluster, managedClusterAddonCopy)
 		if err != nil {
-			meta.SetStatusCondition(&managedClusterAddonCopy.Status.Conditions, metav1.Condition{
-				Type:    addonapiv1alpha1.ManagedClusterAddOnRegistrationApplied,
-				Status:  metav1.ConditionFalse,
-				Reason:  addonapiv1alpha1.RegistrationAppliedSetPermissionFailed,
-				Message: fmt.Sprintf("Failed to set permission for hub agent: %v", err),
-			})
-			if _, patchErr := addonPatcher.PatchStatus(
-				ctx, managedClusterAddonCopy, managedClusterAddonCopy.Status, managedClusterAddon.Status); patchErr != nil {
-				return fmt.Errorf("failed to patch status condition (set permission for hub agent) of managedclusteraddon: %w", patchErr)
+			// Check if this is a subject not ready error
+			var subjectErr *agent.SubjectNotReadyError
+			if errors.As(err, &subjectErr) {
+				klog.Infof("Permission configuration pending for addon %q: %v", key, subjectErr)
+				permissionReady = false
+			} else {
+				// This is a real error, set condition to false and return immediately
+				meta.SetStatusCondition(&managedClusterAddonCopy.Status.Conditions, metav1.Condition{
+					Type:    addonapiv1alpha1.ManagedClusterAddOnRegistrationApplied,
+					Status:  metav1.ConditionFalse,
+					Reason:  addonapiv1alpha1.RegistrationAppliedSetPermissionFailed,
+					Message: fmt.Sprintf("Failed to set permission for hub agent: %v", err),
+				})
+				if _, patchErr := addonPatcher.PatchStatus(
+					ctx, managedClusterAddonCopy, managedClusterAddonCopy.Status, managedClusterAddon.Status); patchErr != nil {
+					return fmt.Errorf("failed to patch status condition (set permission for hub agent) of managedclusteraddon: %w", patchErr)
+				}
+				return err
 			}
-			return err
 		}
 	}
 
@@ -183,7 +251,16 @@ func (c *addonRegistrationController) sync(ctx context.Context, syncCtx factory.
 	if err != nil {
 		return fmt.Errorf("failed to get csr configurations: %w", err)
 	}
-	managedClusterAddonCopy.Status.Registrations = configs
+
+	// Use kubeClientDriver from existing status
+	kubeClientDriver := managedClusterAddon.Status.KubeClientDriver
+	registrations, registrationConfigReady := buildRegistrationConfigs(configs, managedClusterAddon.Status.Registrations, kubeClientDriver)
+	if !registrationConfigReady {
+		klog.Infof("Registration configuration pending for addon %q: kubeClientDriver is not set", key)
+	}
+
+	// Always update registrations and namespace, even if configuration is not ready yet
+	managedClusterAddonCopy.Status.Registrations = registrations
 
 	// explicitly set the default namespace value, since the mca.spec.installNamespace is deprceated and
 	//  the addonDeploymentConfig.spec.agentInstallNamespace could be empty
@@ -209,16 +286,37 @@ func (c *addonRegistrationController) sync(ctx context.Context, syncCtx factory.
 		}
 	}
 
-	meta.SetStatusCondition(&managedClusterAddonCopy.Status.Conditions, metav1.Condition{
-		Type:    addonapiv1alpha1.ManagedClusterAddOnRegistrationApplied,
-		Status:  metav1.ConditionTrue,
-		Reason:  addonapiv1alpha1.RegistrationAppliedSetPermissionApplied,
-		Message: "Registration of the addon agent is configured",
-	})
+	// Set condition based on whether permission is ready AND registration config is ready
+	switch {
+	case permissionReady && registrationConfigReady:
+		// Both permission ready and registration config ready - success
+		meta.SetStatusCondition(&managedClusterAddonCopy.Status.Conditions, metav1.Condition{
+			Type:    addonapiv1alpha1.ManagedClusterAddOnRegistrationApplied,
+			Status:  metav1.ConditionTrue,
+			Reason:  addonapiv1alpha1.RegistrationAppliedSetPermissionApplied,
+			Message: "Registration of the addon agent is configured",
+		})
+	case !registrationConfigReady:
+		// Registration config not ready - waiting for agent to set kubeClientDriver
+		meta.SetStatusCondition(&managedClusterAddonCopy.Status.Conditions, metav1.Condition{
+			Type:    addonapiv1alpha1.ManagedClusterAddOnRegistrationApplied,
+			Status:  metav1.ConditionFalse,
+			Reason:  "RegistrationConfigPending",
+			Message: "Waiting for addon agent to set kubeClientDriver in status",
+		})
+	default:
+		// Permission not ready
+		meta.SetStatusCondition(&managedClusterAddonCopy.Status.Conditions, metav1.Condition{
+			Type:    addonapiv1alpha1.ManagedClusterAddOnRegistrationApplied,
+			Status:  metav1.ConditionFalse,
+			Reason:  "PermissionConfigPending",
+			Message: "registration subject not ready",
+		})
+	}
 
 	_, err = addonPatcher.PatchStatus(ctx, managedClusterAddonCopy, managedClusterAddonCopy.Status, managedClusterAddon.Status)
 	if err != nil {
-		return fmt.Errorf("failed to patch status condition(successfully configured) of managedclusteraddon: %w", err)
+		return fmt.Errorf("failed to patch status condition of managedclusteraddon: %w", err)
 	}
 	return nil
 }
